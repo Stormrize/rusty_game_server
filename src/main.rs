@@ -92,13 +92,13 @@ impl ApiError {
         Self::new(StatusCode::BAD_REQUEST, "bad_request", message)
     }
     fn not_found() -> Self {
-        Self::new(StatusCode::NOT_FOUND, "not_found", "Партия не найдена")
+        Self::new(StatusCode::NOT_FOUND, "not_found", "Game not found")
     }
     fn unauthorized() -> Self {
         Self::new(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
-            "Нужен корректный x-player-token",
+            "Correct x-player-token is needed",
         )
     }
     fn conflict(message: impl Into<String>) -> Self {
@@ -224,6 +224,26 @@ async fn create_game(State(state): State<AppState>) -> (StatusCode, Json<CreateR
     )
 }
 
+async fn find_game(State(state): State<AppState>) -> Result<Json<JoinResponse>, ApiError> {
+    let mut games = state.games.lock().await;
+
+    for (game_id, game) in games.iter_mut() {
+        if game.black_token.is_none() {
+            let token = new_token();
+            game.black_token = Some(token.clone());
+            let dto = game.dto(game_id, Color::Black);
+
+            return Ok(Json(JoinResponse {
+                game_id: game_id.clone(),
+                token,
+                color: "black",
+                state: dto,
+            }));
+        }
+    }
+    Err(ApiError::not_found())
+}
+
 async fn join_game(
     State(state): State<AppState>,
     Path(game_id): Path<String>,
@@ -231,10 +251,12 @@ async fn join_game(
     let mut games = state.games.lock().await;
     let game = games.get_mut(&game_id).ok_or_else(ApiError::not_found)?;
     if game.black_token.is_some() {
-        return Err(ApiError::conflict("В партии уже есть второй игрок"));
+        return Err(ApiError::conflict(
+            "There is already a second player in the game.",
+        ));
     }
     if game.board.status() != BoardStatus::Ongoing {
-        return Err(ApiError::conflict("Эта партия уже завершена"));
+        return Err(ApiError::conflict("This game has already ended."));
     }
     let token = new_token();
     game.black_token = Some(token.clone());
@@ -246,7 +268,6 @@ async fn join_game(
         state: dto,
     }))
 }
-
 async fn get_game(
     State(state): State<AppState>,
     Path(game_id): Path<String>,
@@ -275,19 +296,19 @@ async fn make_move(
         .ok_or_else(ApiError::unauthorized)?;
 
     if game.black_token.is_none() {
-        return Err(ApiError::conflict("Ожидаем подключения соперника"));
+        return Err(ApiError::conflict("Waiting for the opponent to connect..."));
     }
     if game.board.status() != BoardStatus::Ongoing {
-        return Err(ApiError::conflict("Партия уже завершена"));
+        return Err(ApiError::conflict("The game has already ended."));
     }
     if color != game.board.side_to_move() {
-        return Err(ApiError::conflict("Сейчас ход соперника"));
+        return Err(ApiError::conflict("It is the opponent's turn now."));
     }
 
     let from = Square::from_str(&input.from.to_ascii_lowercase())
-        .map_err(|_| ApiError::bad_request("Поле from должно быть клеткой, например e2"))?;
+        .map_err(|_| ApiError::bad_request("The 'from' field must be a square, for example e2"))?;
     let to = Square::from_str(&input.to.to_ascii_lowercase())
-        .map_err(|_| ApiError::bad_request("Поле to должно быть клеткой, например e4"))?;
+        .map_err(|_| ApiError::bad_request("The 'to' field must be a square, for example e4"))?;
     let promotion_name = input
         .promotion
         .as_deref()
@@ -298,14 +319,18 @@ async fn make_move(
         Some("r") | Some("rook") => Some(Piece::Rook),
         Some("b") | Some("bishop") => Some(Piece::Bishop),
         Some("n") | Some("knight") => Some(Piece::Knight),
-        _ => return Err(ApiError::bad_request("promotion: допустимы q, r, b или n")),
+        _ => {
+            return Err(ApiError::bad_request(
+                "promotion: q, r, b, or n are allowed",
+            ));
+        }
     };
     let chess_move = ChessMove::new(from, to, promotion);
 
     // Board::legal validates movement, captures, castling, en passant,
     // check constraints and promotion as one legal chess move.
     if !game.board.legal(chess_move) {
-        return Err(ApiError::conflict("Недопустимый шахматный ход"));
+        return Err(ApiError::conflict("Illegal chess move"));
     }
 
     let mut uci = format!("{}{}", from, to);
@@ -332,12 +357,12 @@ async fn main() {
     let app = Router::new()
         .route("/api/health", get(health))
         .route("/api/games", post(create_game))
+        .route("/api/games/join", post(find_game))
         .route("/api/games/{id}/join", post(join_game))
         .route("/api/games/{id}", get(get_game))
         .route("/api/games/{id}/moves", post(make_move))
         .with_state(state);
 
-    // 0.0.0.0 is required so ESP32 devices on the LAN can connect.
     let addr = std::env::var("CHESS_BIND")
         .unwrap_or_else(|_| "0.0.0.0:8787".to_owned())
         .parse::<SocketAddr>()
